@@ -1,0 +1,11 @@
+prefix=/home/minu/dreamerv3/.conda
+exec_prefix=/home/minu/dreamerv3/.conda
+libdir=/home/minu/dreamerv3/.conda/lib
+includedir=/home/minu/dreamerv3/.conda/include
+
+Name: uuid
+Description: Universally unique id library
+Version: 2.32.1
+Requires:
+Cflags: -I${includedir}/uuid
+Libs: -L${libdir} -luuid

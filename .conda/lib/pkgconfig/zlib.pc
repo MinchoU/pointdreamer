@@ -1,0 +1,13 @@
+prefix=/home/minu/dreamerv3/.conda
+exec_prefix=/home/minu/dreamerv3/.conda
+libdir=/home/minu/dreamerv3/.conda/lib
+sharedlibdir=/home/minu/dreamerv3/.conda/lib
+includedir=/home/minu/dreamerv3/.conda/include
+
+Name: zlib
+Description: zlib compression library
+Version: 1.2.13
+
+Requires:
+Libs: -L${libdir} -L${sharedlibdir} -lz
+Cflags: -I${includedir}
