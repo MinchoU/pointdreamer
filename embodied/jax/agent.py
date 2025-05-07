@@ -52,6 +52,9 @@ class Agent(embodied.Agent):
     assert 'reset' not in act_space
 
     self.model = model
+
+    self.ignore_keys = ["raw_pointcloud", "render_image", "world_pointcloud", "obs_frame_pose"]
+    obs_space = {k: v for k, v in obs_space.items() if k not in self.ignore_keys}
     self.obs_space = obs_space
     self.act_space = act_space
     self.config = config
@@ -66,6 +69,7 @@ class Agent(embodied.Agent):
     elements.print('Extras', color='cyan')
     [elements.print(f'  {k:<16} {v}') for k, v in ext_space.items()]
     self.spaces = dict(**obs_space, **act_space, **ext_space)
+    
     assert not (obs_space.keys() & ext_space.keys()), (obs_space, ext_space)
     assert not (act_space.keys() & ext_space.keys()), (act_space, ext_space)
 
@@ -153,7 +157,17 @@ class Agent(embodied.Agent):
         nj.pure(self.model.policy), self.policy_mesh,
         (pp, pm, ps, ps), (ps, ps, ps), ar,
         static_argnums=(4,), **shared_kwargs)
-
+    
+    if self.model.use_pcd:
+      if self.model.downsample_method == 'fps':
+        self._downsample = transform.apply(
+            nj.pure(self.model.downsample), self.policy_mesh,
+            (pm, pm, ps), (ps,), ar, # empty params, seed, points
+            single_output=True, **shared_kwargs
+          )
+        self.downsample_lock = threading.Lock()
+        self.n_downsamples = elements.Counter()
+      
     self.policy_lock = threading.Lock()
     self.train_lock = threading.Lock()
     self.n_updates = elements.Counter()
@@ -216,13 +230,30 @@ class Agent(embodied.Agent):
     return self._init_report(
         self.params, self._seeds(0, self.train_mirrored), batch_size)
 
+  @elements.timer.section('jaxagent_downsample')
+  def downsample(self, points, mode="train"):
+    points = internal.device_put(points, self.policy_sharded)
+    with self.downsample_lock:
+      with self.n_downsamples.lock:
+        counter = self.n_downsamples.value
+        self.n_downsamples.value += 1
+      seed = self._seeds(counter, self.policy_mirrored)
+      new_points = self._downsample({}, seed, points)
+    if mode != "train":
+      new_points = np.asarray(internal.fetch_async(new_points))
+    return new_points
+
   @elements.timer.section('jaxagent_policy')
   def policy(self, carry, obs, mode='train'):
+    filtered_obs = {k: v for k, v in obs.items() if k not in self.ignore_keys}
+    obs = filtered_obs
+
     if not self.jaxcfg.enable_policy:
       raise Exception('Policy not available when enable_policy=False')
+
     assert not any(k.startswith('log/') for k in obs), obs.keys()
-    assert sorted(obs.keys()) == sorted(self.obs_space.keys()), (
-        sorted(obs.keys()), sorted(self.obs_space.keys()))
+    # assert sorted(obs.keys()) == sorted(self.obs_space.keys()), (
+    #     sorted(obs.keys()), sorted(self.obs_space.keys())
     for key, space in self.obs_space.items():
       assert np.isfinite(obs[key]).all(), (obs[key], key, space)
 
@@ -263,6 +294,10 @@ class Agent(embodied.Agent):
   @elements.timer.section('jaxagent_train')
   def train(self, carry, data):
     seed = data.pop('seed')
+    # data = {k: v for k, v in data.items() if k in self.spaces}
+    filterd_data = {k: v for k, v in data.items() if k not in self.ignore_keys}
+    data = filterd_data
+
     assert sorted(data.keys()) == sorted(self.spaces.keys()), (
         sorted(data.keys()), sorted(self.spaces.keys()))
     allo = {k: v for k, v in self.params.items() if k in self.policy_keys}
@@ -299,10 +334,12 @@ class Agent(embodied.Agent):
         copyto = outdir
         outdir = elements.Path('/tmp/profiler')
         outdir.mkdir()
-      if self.n_updates == 100:
+      # if self.n_updates == 100:
+      if self.n_updates == 1:
         elements.print(f'Start JAX profiler: {str(outdir)}', color='yellow')
         jax.profiler.start_trace(str(outdir))
-      if self.n_updates == 120:
+      # if self.n_updates == 120:
+      if self.n_updates == 3:
         elements.print('Stop JAX profiler', color='yellow')
         jax.profiler.stop_trace()
         if copyto:
@@ -315,6 +352,9 @@ class Agent(embodied.Agent):
   @elements.timer.section('jaxagent_report')
   def report(self, carry, data):
     seed = data.pop('seed')
+    filtered_data = {k: v for k, v in data.items() if k not in self.ignore_keys}
+    data = filtered_data
+    # data = {k: v for k, v in data.items() if k in self.spaces}
     assert sorted(data.keys()) == sorted(self.spaces.keys()), (
         sorted(data.keys()), sorted(self.spaces.keys()))
     with self.train_lock:
@@ -412,12 +452,13 @@ class Agent(embodied.Agent):
     GB = B * jax.process_count()
     T = self.config.batch_length
     C = self.config.replay_context
+    M = self.config.multi_step_length
     tm, ts = self.train_mirrored, self.train_sharded
     us = self.jaxcfg.use_shardmap
 
     with jax._src.config.explicit_device_get_scope():
       seed = jax.device_put(np.array([self.config.seed, 0], np.uint32), tm)
-    data = internal.device_put(self._zeros(self.spaces, (B, T + C)), ts)
+    data = internal.device_put(self._zeros(self.spaces, (B, T + C + M)), ts)
     pr, ar = self.partition_rules
 
     params, params_sharding = transform.init(
@@ -447,8 +488,9 @@ class Agent(embodied.Agent):
   def _compile_train(self):
     B = self.config.batch_size
     T = self.config.batch_length
+    M = self.config.multi_step_length
     C = self.config.replay_context
-    data = self._zeros(self.spaces, (B, T + C))
+    data = self._zeros(self.spaces, (B, T + C + M))
     data = internal.device_put(data, self.train_sharded)
     seed = self._seeds(0, self.train_mirrored)
     carry = self.init_train(B)
@@ -460,7 +502,8 @@ class Agent(embodied.Agent):
     B = self.config.batch_size
     T = self.config.report_length
     C = self.config.replay_context
-    data = self._zeros(self.spaces, (B, T + C))
+    M = self.config.multi_step_length
+    data = self._zeros(self.spaces, (B, T + C + M))
     data = internal.device_put(data, self.train_sharded)
     seed = self._seeds(0, self.train_mirrored)
     carry = self.init_report(B)

@@ -190,6 +190,8 @@ class Encoder(nj.Module):
   strided: bool = False
   #### for rgbd
   depth_max: int = 1000
+  #### for pointcloud
+  use_pcd: bool = False
 
   def __init__(self, obs_space, **kw):
     assert all(len(s.shape) <= 3 for s in obs_space.values()), obs_space
@@ -278,6 +280,8 @@ class Decoder(nj.Module):
   bspace: int = 8
   outer: bool = False
   strided: bool = False
+  ## for pcd
+  use_pcd: bool = False
 
   def __init__(self, obs_space, **kw):
     assert all(len(s.shape) <= 3 for s in obs_space.values()), obs_space
@@ -371,3 +375,14 @@ class Decoder(nj.Module):
 
     entries = {}
     return carry, entries, recons
+
+class DummyModule:
+  @property
+  def entry_space(self):
+    return {}
+
+  def initial(self, batch_size):
+    return {}
+
+  def truncate(self, entries, carry=None):
+    return {}

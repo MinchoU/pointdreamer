@@ -11,6 +11,8 @@ import numpy as np
 import optax
 
 from . import rssm
+from pointclouds import downsample
+from pointclouds import encoders as pc_enc
 
 f32 = jnp.float32
 i32 = jnp.int32
@@ -32,6 +34,8 @@ class Agent(embodied.jax.Agent):
   ]
 
   def __init__(self, obs_space, act_space, config):
+    ignores = ('render_image', 'raw_pointcloud', 'obs_frame_pose', 'world_pointcloud')
+    obs_space = {k: v for k, v in obs_space.items() if k not in ignores}
     self.obs_space = obs_space
     self.act_space = act_space
     self.config = config
@@ -40,17 +44,35 @@ class Agent(embodied.jax.Agent):
     enc_space = {k: v for k, v in obs_space.items() if k not in exclude}
     dec_space = {k: v for k, v in obs_space.items() if k not in exclude}
 
-    # for sensor depth
-    self.depth_max = config.depth_max
+    self.depth_max = config.depth_max # for rgbd reconstruction
+    self.use_pcd = config.use_pcd
+    self.downsample_method = config.downsample_method
+    self.wm_type = config.wm_type
+    
     self.enc = {
         'simple': rssm.Encoder,
-    }[config.enc.typ](enc_space, **config.enc[config.enc.typ], name='enc', depth_max=self.depth_max)
+        'pointconv': pc_enc.PointConvEncoder,
+    }[config.enc.typ](enc_space, **config.enc[config.enc.typ], name='enc', 
+                      depth_max=self.depth_max, # for depth scaling to 0-1
+                      use_pcd = config.use_pcd,
+                      )
     self.dyn = {
         'rssm': rssm.RSSM,
     }[config.dyn.typ](act_space, **config.dyn[config.dyn.typ], name='dyn')
-    self.dec = {
-        'simple': rssm.Decoder,
-    }[config.dec.typ](dec_space, **config.dec[config.dec.typ], name='dec')
+
+    if self.wm_type == "pcwm":
+      # no decoder for pcwmp
+      self.dec = rssm.DummyModule()
+    else:
+      self.dec = {
+          'simple': rssm.Decoder,
+      }[config.dec.typ](dec_space, **config.dec[config.dec.typ], name='dec',
+                        use_pcd = config.use_pcd,)
+    
+    if self.use_pcd:
+      self.downsampler = {
+        'fps': downsample.FPS
+      }[config.downsample_method](config.n_downsample_pts, name='ds')
 
     self.feat2tensor = lambda x: jnp.concatenate([
         nn.cast(x['deter']),
@@ -77,6 +99,10 @@ class Agent(embodied.jax.Agent):
 
     self.modules = [
         self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val]
+    
+    if self.wm_type == "pcwm":
+      del self.modules[2]
+
     self.opt = embodied.jax.Optimizer(
         self.modules, self._make_opt(**config.opt), summary_depth=1,
         name='opt')
@@ -84,11 +110,18 @@ class Agent(embodied.jax.Agent):
     scales = self.config.loss_scales.copy()
     rec = scales.pop('rec')
     scales.update({k: rec for k in dec_space})
+    if self.wm_type == "pcwm":
+      del scales['pointcloud']
+    else:
+      del scales['ms_rew']
     self.scales = scales
 
   @property
   def policy_keys(self):
-    return '^(enc|dyn|dec|pol)/'
+    if self.wm_type != "pcwm":
+      return '^(enc|dyn|dec|pol)/'
+    else:
+      return '^(enc|dyn|pol)/'
 
   @property
   def ext_space(self):
@@ -101,6 +134,9 @@ class Agent(embodied.jax.Agent):
           dyn=self.dyn.entry_space,
           dec=self.dec.entry_space)))
     return spaces
+
+  def downsample(self, points):
+    return self.downsampler(points)
 
   def init_policy(self, batch_size):
     zeros = lambda x: jnp.zeros((batch_size, *x.shape), x.dtype)
@@ -145,6 +181,9 @@ class Agent(embodied.jax.Agent):
     metrics.update(mets)
     self.slowval.update()
     outs = {}
+
+    obs = {k: v[:, :self.config.batch_length] for k, v in obs.items()}
+    stepid = stepid[:, :self.config.batch_length]
     if self.config.replay_context:
       updates = elements.tree.flatdict(dict(
           stepid=stepid, enc=entries[0], dyn=entries[1], dec=entries[2]))
@@ -157,7 +196,14 @@ class Agent(embodied.jax.Agent):
     carry = (*carry, {k: data[k][:, -1] for k in self.act_space})
     return carry, outs, metrics
 
-  def loss(self, carry, obs, prevact, training):
+  def loss(self, carry, batch_obs, batch_prevact, training):
+    if self.config.multi_step_length>0:
+      obs = {k: v[:, :-self.config.multi_step_length] for k, v in batch_obs.items()}
+      prevact = {k: v[:, :-self.config.multi_step_length] for k, v in batch_prevact.items()}
+    else:
+      obs = batch_obs
+      prevact = batch_prevact
+
     enc_carry, dyn_carry, dec_carry = carry
     reset = obs['is_first']
     B, T = reset.shape
@@ -171,30 +217,59 @@ class Agent(embodied.jax.Agent):
         dyn_carry, tokens, prevact, reset, training)
     losses.update(los)
     metrics.update(mets)
-    dec_carry, dec_entries, recons = self.dec(
-        dec_carry, repfeat, reset, training)
+    if self.wm_type != "pcwm":
+      dec_carry, dec_entries, recons = self.dec(
+          dec_carry, repfeat, reset, training)
+    else:
+      dec_entries = {}
     inp = sg(self.feat2tensor(repfeat), skip=self.config.reward_grad)
     losses['rew'] = self.rew(inp, 2).loss(obs['reward'])
     con = f32(~obs['is_terminal'])
     if self.config.contdisc:
       con *= 1 - 1 / self.config.horizon
     losses['con'] = self.con(self.feat2tensor(repfeat), 2).loss(con)
-    for key, recon in recons.items():
-      space, value = self.obs_space[key], obs[key]
-      assert value.dtype == space.dtype, (key, space, value.dtype)
-      if isimage(space):    
-          if space.shape[-1] == 4:
-              rgb   = f32(value[..., :3]) / 255.0
-              depth = f32(value[..., 3:]) / self.depth_max
-              target = jnp.concatenate([rgb, depth], axis=-1)
-          else:
-              target = f32(value) / 255.0
-      else:
-          target = value
+    
+    if self.wm_type != "pcwm":
+      for key, recon in recons.items():
+        space, value = self.obs_space[key], obs[key]
+        assert value.dtype == space.dtype, (key, space, value.dtype)
+        if isimage(space):    
+            if space.shape[-1] == 4:
+                rgb   = f32(value[..., :3]) / 255.0
+                depth = f32(value[..., 3:]) / self.depth_max
+                target = jnp.concatenate([rgb, depth], axis=-1)
+            else:
+                target = f32(value) / 255.0
+        else:
+            target = value
 
-      losses[key] = recon.loss(sg(target))
-      # target = f32(value) / 255 if isimage(space) else value
-      # losses[key] = recon.loss(sg(target))
+        losses[key] = recon.loss(sg(target))
+    else:
+      # multi step reward loss
+      H_ms = self.config.multi_step_length
+
+      B, T = reset.shape
+      reward_all = batch_obs['reward']  # (B, T+H_ms)
+      real_ms = jnp.stack(
+        [reward_all[:, i+1 : i+1+T] for i in range(H_ms)],
+        axis=-1,
+      )  # → (B, T, H_ms)
+
+      act_all = batch_prevact['action']
+      act_ms = jnp.stack(
+        [act_all[:, i : i+T] for i in range(H_ms)],
+        axis=2,
+      )  # → (B, T, H_ms, A)
+
+      starts = self.dyn.starts(dyn_entries, dyn_carry, T)  # dict of (B*T, …)
+      B, T, _, A = act_ms.shape
+      act_flat = act_ms.reshape(B*T, H_ms, A)              # (B*T, H_ms, A)
+      act_inp = {k: act_flat for k in self.act_space}
+      _, feat_ms, _ = self.dyn.imagine(starts, act_inp, H_ms, training)
+      ms_inp = self.feat2tensor(feat_ms)                   # (B*T, H_ms, feat_dim)
+      loss_ms = self.rew(ms_inp, 2).loss(real_ms.reshape(B*T, H_ms))
+      losses['ms_rew'] = loss_ms.sum(axis=-1).reshape(B, T)
+
 
     B, T = reset.shape
     shapes = {k: v.shape for k, v in losses.items()}
@@ -295,66 +370,68 @@ class Agent(embodied.jax.Agent):
         firsthalf(obs['is_first']), training=False)
     _, imgfeat, _ = self.dyn.imagine(
         dyn_carry, secondhalf(prevact), length=T - T // 2, training=False)
-    dec_carry, _, obsrecons = self.dec(
-        dec_carry, obsfeat, firsthalf(obs['is_first']), training=False)
-    dec_carry, _, imgrecons = self.dec(
-        dec_carry, imgfeat, jnp.zeros_like(secondhalf(obs['is_first'])),
-        training=False)
+    
+    if self.wm_type != "pcwm":
+      dec_carry, _, obsrecons = self.dec(
+          dec_carry, obsfeat, firsthalf(obs['is_first']), training=False)
+      dec_carry, _, imgrecons = self.dec(
+          dec_carry, imgfeat, jnp.zeros_like(secondhalf(obs['is_first'])),
+          training=False)
 
-    # Video preds
-    for key in self.dec.imgkeys:
-      if obs['image'].shape[-1]!=4:
-        assert obs[key].dtype == jnp.uint8
-        true = obs[key][:RB]
-        pred = jnp.concatenate([obsrecons[key].pred(), imgrecons[key].pred()], 1)
-        pred = jnp.clip(pred * 255, 0, 255).astype(jnp.uint8)
-        error = ((i32(pred) - i32(true) + 255) / 2).astype(np.uint8)
-        video = jnp.concatenate([true, pred, error], 2)
+      # Video preds
+      for key in self.dec.imgkeys:
+        if obs['image'].shape[-1]!=4:
+          assert obs[key].dtype == jnp.uint8
+          true = obs[key][:RB]
+          pred = jnp.concatenate([obsrecons[key].pred(), imgrecons[key].pred()], 1)
+          pred = jnp.clip(pred * 255, 0, 255).astype(jnp.uint8)
+          error = ((i32(pred) - i32(true) + 255) / 2).astype(np.uint8)
+          video = jnp.concatenate([true, pred, error], 2)
 
-        video = jnp.pad(video, [[0, 0], [0, 0], [2, 2], [2, 2], [0, 0]])
-        mask = jnp.zeros(video.shape, bool).at[:, :, 2:-2, 2:-2, :].set(True)
-        border = jnp.full((T, 3), jnp.array([0, 255, 0]), jnp.uint8)
-        border = border.at[T // 2:].set(jnp.array([255, 0, 0], jnp.uint8))
-        video = jnp.where(mask, video, border[None, :, None, None, :])
-        video = jnp.concatenate([video, 0 * video[:, :10]], 1)
+          video = jnp.pad(video, [[0, 0], [0, 0], [2, 2], [2, 2], [0, 0]])
+          mask = jnp.zeros(video.shape, bool).at[:, :, 2:-2, 2:-2, :].set(True)
+          border = jnp.full((T, 3), jnp.array([0, 255, 0]), jnp.uint8)
+          border = border.at[T // 2:].set(jnp.array([255, 0, 0], jnp.uint8))
+          video = jnp.where(mask, video, border[None, :, None, None, :])
+          video = jnp.concatenate([video, 0 * video[:, :10]], 1)
 
-        B, T, H, W, C = video.shape
-        grid = video.transpose((1, 2, 0, 3, 4)).reshape((T, H, B * W, C))
-        metrics[f'openloop/{key}'] = grid
-      else:
-        # including depth
-        true = obs[key][:RB]
-        pred = jnp.concatenate([obsrecons[key].pred(), imgrecons[key].pred()], 1)
-        pred = jnp.clip(pred * 255, 0, 255).astype(jnp.uint8)
-        true_rgb, true_d = true[..., :3], true[..., 3:]
-        pred_rgb, pred_d = pred[..., :3], pred[..., 3:]
-        pred_rgb = jnp.clip(pred_rgb * 255, 0, 255).astype(jnp.uint8)
+          B, T, H, W, C = video.shape
+          grid = video.transpose((1, 2, 0, 3, 4)).reshape((T, H, B * W, C))
+          metrics[f'openloop/{key}'] = grid
+        else:
+          # including depth
+          true = obs[key][:RB]
+          pred = jnp.concatenate([obsrecons[key].pred(), imgrecons[key].pred()], 1)
 
-        err_rgb = ((i32(pred_rgb) - i32(true_rgb) + 255) // 2).astype(jnp.uint8)
-        panel_rgb = jnp.concatenate([true_rgb, pred_rgb, err_rgb], 2)  # (B,T,H, 3W,3)
+          true_rgb, true_d = true[..., :3], true[..., 3:]
+          pred_rgb, pred_d = pred[..., :3], pred[..., 3:]
+          pred_rgb = jnp.clip(pred_rgb * 255, 0, 255).astype(jnp.uint8)
 
-        true_d = depth_to_u8(true_d/self.depth_max)
-        pred_d = depth_to_u8(pred_d)
+          err_rgb = ((i32(pred_rgb) - i32(true_rgb) + 255) // 2).astype(jnp.uint8)
+          panel_rgb = jnp.concatenate([true_rgb, pred_rgb, err_rgb], 2)  # (B,T,H, 3W,3)
 
-        err_d = ((i32(pred_d) - i32(true_d) + 255) // 2).astype(jnp.uint8)
-        panel_d = jnp.concatenate([true_d, pred_d, err_d], 2)          # (B,T,H,3W,1)
-        panel_d = jnp.repeat(panel_d, 3, axis=-1)                      # → (B,T,H,3W,3)
+          true_d = depth_to_u8(true_d/self.depth_max)
+          pred_d = depth_to_u8(pred_d)
 
-        video = jnp.concatenate([panel_rgb, panel_d], axis=2)      
+          err_d = ((i32(pred_d) - i32(true_d) + 255) // 2).astype(jnp.uint8)
+          panel_d = jnp.concatenate([true_d, pred_d, err_d], 2)          # (B,T,H,3W,1)
+          panel_d = jnp.repeat(panel_d, 3, axis=-1)                      # → (B,T,H,3W,3)
 
-        video = jnp.pad(video, [[0,0],[0,0],[2,2],[2,2],[0,0]])
-        mask  = jnp.zeros(video.shape, bool).at[:,:,2:-2,2:-2,:].set(True)
-        border = jnp.full((T,3), jnp.array([0,255,0], jnp.uint8))
-        border = border.at[T//2:].set(jnp.array([255,0,0], jnp.uint8))
-        video  = jnp.where(mask, video, border[None,:,None,None,:])
-        video  = jnp.concatenate([video, 0 * video[:, :10]], 1)
+          video = jnp.concatenate([panel_rgb, panel_d], axis=2)      
 
-        B, T, H, W, C = video.shape
-        grid = video.transpose((1, 2, 0, 3, 4)).reshape((T, H, B * W, C))
-        metrics[f'openloop/{key}'] = grid.astype(np.uint8)
+          video = jnp.pad(video, [[0,0],[0,0],[2,2],[2,2],[0,0]])
+          mask  = jnp.zeros(video.shape, bool).at[:,:,2:-2,2:-2,:].set(True)
+          border = jnp.full((T,3), jnp.array([0,255,0], jnp.uint8))
+          border = border.at[T//2:].set(jnp.array([255,0,0], jnp.uint8))
+          video  = jnp.where(mask, video, border[None,:,None,None,:])
+          video  = jnp.concatenate([video, 0 * video[:, :10]], 1)
 
-      carry = (*new_carry, {k: data[k][:, -1] for k in self.act_space})
-      return carry, metrics
+          B, T, H, W, C = video.shape
+          grid = video.transpose((1, 2, 0, 3, 4)).reshape((T, H, B * W, C))
+          metrics[f'openloop/{key}'] = grid.astype(np.uint8)
+
+    carry = (*new_carry, {k: data[k][:, -1] for k in self.act_space})
+    return carry, metrics
 
   def _apply_replay_context(self, carry, data):
     (enc_carry, dyn_carry, dec_carry, prevact) = carry
@@ -363,6 +440,7 @@ class Agent(embodied.jax.Agent):
     obs = {k: data[k] for k in self.obs_space}
     prepend = lambda x, y: jnp.concatenate([x[:, None], y[:, :-1]], 1)
     prevact = {k: prepend(prevact[k], data[k]) for k in self.act_space}
+    
     if not self.config.replay_context:
       return carry, obs, prevact, stepid
 

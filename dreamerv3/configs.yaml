@@ -1,5 +1,5 @@
 defaults:
-
+# python dreamerv3/main.py --logdir ./logdir/dreamer/{timestamp} --configs maniskill --task maniskill_PickCube-v1 --run.train_ratio 256 --run.envs 1 --agent.enc.typ pointconv  --env.maniskill.obs_mode=pointcloud+rgb --agent.wm_type pcwm --env.maniskill.cam_name base_camera --env.maniskill.obs_frame base_pose
   logdir: ~/logdir/{timestamp}
   replica: 0
   replicas: 1
@@ -35,7 +35,7 @@ defaults:
     minecraft: {size: [64, 64], break_speed: 100.0, logs: False, length: 36000}
     dmc: {size: [64, 64], repeat: 1, proprio: True, image: True, camera: -1}
     loconav: {size: [64, 64], repeat: 1, camera: -1}
-    maniskill: {size: [64, 64], obs_mode: "rgb", control_mode: pd_ee_delta_pose, cam_name: "hand_camera", depth_max_mm: 1000}
+    maniskill: {size: [64, 64], obs_mode: "rgb", control_mode: pd_ee_delta_pose, cam_name: "hand_camera", depth_max_mm: 1000, obs_frame: "tcp_pose", n_downsample_pts: 1024, use_segmented_pts: False}
 
   replay:
     size: 5e6
@@ -84,15 +84,17 @@ defaults:
     coordinator_address: ''
 
   agent:
-    loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3}
+    loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3, ms_rew: 1.0}
     opt: {lr: 4e-5, agc: 0.3, eps: 1e-20, beta1: 0.9, beta2: 0.999, momentum: True, wd: 0.0, schedule: const, warmup: 1000, anneal: 0}
     ac_grads: False
+    wm_type: dreamer # pcwm
     dyn:
       typ: rssm
       rssm: {deter: 8192, hidden: 1024, stoch: 32, classes: 64, act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in, imglayers: 2, obslayers: 1, dynlayers: 1, absolute: False, blocks: 8, free_nats: 1.0}
     enc:
       typ: simple
       simple: {depth: 64, mults: [2, 3, 4, 4], layers: 3, units: 1024, act: silu, norm: rms, winit: trunc_normal_in, symlog: True, outer: False, kernel: 5, strided: False}
+      pointconv: {bandwidths: [0.05, 0.1, 0.2, 0.4]}
     dec:
       typ: simple
       simple: {depth: 64, mults: [2, 3, 4, 4], layers: 3, units: 1024, act: silu, norm: rms, outscale: 1.0, winit: trunc_normal_in, outer: False, kernel: 5, bspace: 8, strided: False}
@@ -104,7 +106,6 @@ defaults:
     policy_dist_cont: bounded_normal
     imag_last: 0
     imag_length: 15
-    depth_max: 1000
     horizon: 333
     contdisc: True
     imag_loss: {slowtar: False, lam: 0.95, actent: 3e-4, slowreg: 1.0}
@@ -118,6 +119,14 @@ defaults:
     repval_grad: True
     report: True
     report_gradnorms: False
+    # for pointclouds
+    depth_max: 1000 # millimeter
+    use_pcd: False
+    n_downsample_pts: 1024
+    downsample_method: fps
+    # for pcwm
+    multi_step_length: 5
+    
 
 size1m: &size1m
   .*\.rssm: {deter: 512, hidden: 64, classes: 4}
@@ -189,8 +198,15 @@ dmc_vision:
   run: {steps: 1.1e6, train_ratio: 256}
 
 maniskill:
-  task: maniskill_PegInsertionSideNobase-v1
-  run: {steps: 1.1e6, train_ratio: 256}
+  task: maniskill_PegInsertionSideNobase-v1 #maniskill_PickCube-v1
+  run: {steps: 1.1e6, train_ratio: 256, "envs": 1}
+  # pcwm setting
+  batch_size: 8
+  agent.dyn.rssm.deter: 256
+  agent.dyn.rssm.hidden: 32
+
+
+
 
 bsuite:
   task: bsuite_mnist/0

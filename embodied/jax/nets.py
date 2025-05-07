@@ -5,6 +5,7 @@ from typing import Callable
 import einops
 import jax
 import jax.ad_checkpoint as adc
+from jax import checkpoint
 import jax.numpy as jnp
 import ninjax as nj
 import numpy as np
@@ -364,6 +365,9 @@ class Norm(nj.Module):
   eps: float = 1e-4
   scale: bool = True
   shift: bool = True
+  # for batchnorm
+  momentum: float = 0.9
+  use_running_stats: bool = True
 
   def __init__(self, impl):
     if '1em' in impl:
@@ -371,12 +375,13 @@ class Norm(nj.Module):
       self._fields['eps'] = 10 ** -int(exp)
     self.impl = impl
 
-  def __call__(self, x):
+  def __call__(self, x, train=True):
     ensure_dtypes(x)
     dtype = x.dtype
     x = f32(x)
     axis = [a % x.ndim for a in self.axis]
     shape = [x.shape[i] if i in axis else 1 for i in range(min(axis), x.ndim)]
+    
     if self.impl == 'none':
       pass
     elif self.impl == 'rms':
@@ -393,6 +398,51 @@ class Norm(nj.Module):
       scale = self._scale(shape, x.dtype)
       shift = self._shift(shape, x.dtype)
       x = (x - mean) * (jax.lax.rsqrt(var + self.eps) * scale) + shift
+    elif self.impl == 'batch':
+      feat_axes = tuple(a % x.ndim for a in self.axis)
+      reduce_axes = tuple(i for i in range(x.ndim) if i not in feat_axes)
+      param_shape = [x.shape[i] if i in feat_axes else 1 for i in range(x.ndim)]
+
+      if self.use_running_stats:
+        if train:
+          # Compute statistics over batch dimension
+          batch_mean = jnp.mean(x, axis=reduce_axes, keepdims=True)
+          batch_mean = adc.checkpoint_name(batch_mean, 'small')
+          
+          # Compute variance
+          batch_var = jnp.mean(jnp.square(x - batch_mean), axis=reduce_axes, keepdims=True)
+          batch_var = adc.checkpoint_name(batch_var, 'small')
+          
+          # Update running statistics if needed
+          if self.use_running_stats:
+            # Update running mean and variance
+            running_mean = self.value('running_mean', jnp.zeros, param_shape, f32)
+            running_var = self.value('running_var', jnp.ones, param_shape, f32)
+            new_running_mean = (1 - self.momentum) * running_mean + self.momentum * batch_mean
+            new_running_var = (1 - self.momentum) * running_var + self.momentum * batch_var
+            
+            # Write new values to store
+            self.write('running_mean', new_running_mean)
+            self.write('running_var', new_running_var)
+          
+            # Use batch statistics for normalization during training
+          mean, var = batch_mean, batch_var
+        else:
+          # Use running statistics during inference
+          if self.use_running_stats:
+            mean = self.value('running_mean', jnp.zeros, param_shape, f32)
+            var = self.value('running_var', jnp.ones, param_shape, f32)
+          else:
+            # If not using running stats, compute batch statistics even in eval mode
+            mean = jnp.mean(x, axis=reduce_axes, keepdims=True)
+            var = jnp.mean(jnp.square(x - mean), axis=reduce_axes, keepdims=True)
+
+        # Get scale and shift parameters
+        scale = self._scale(param_shape, x.dtype)
+        shift = self._shift(param_shape, x.dtype)
+
+        # Normalize
+        x = (x - mean) * (jax.lax.rsqrt(var + self.eps) * scale) + shift
     else:
       raise NotImplementedError(self.impl)
     x = x.astype(dtype)
@@ -408,6 +458,53 @@ class Norm(nj.Module):
       return jnp.zeros(shape, dtype)
     return self.value('shift', jnp.zeros, shape, f32).astype(dtype)
 
+class BatchNorm1d(Norm):
+  """
+  Input: (batch_size, num_features) or (batch_size, num_features, seq_length)
+  """
+  
+  def __init__(self, num_features, eps=1e-4, momentum=0.9, scale=True, shift=True, use_running_stats=True):
+    super().__init__(impl='batch')
+    self._fields['axis'] = (-1,)
+    self._fields['eps'] = eps
+    self._fields['momentum'] = momentum
+    self._fields['scale'] = scale
+    self._fields['shift'] = shift
+    self._fields['num_features'] = num_features
+    self._fields['use_running_stats'] = use_running_stats
+        
+  def __call__(self, x, train=True):
+    assert x.ndim in (2, 3), f"Expected 2D or 3D input, got shape {x.shape}"
+    if x.ndim == 2:
+      assert x.shape[-1] == self._fields['num_features'], \
+        f"Expected {self._fields['num_features']} features, got {x.shape[-1]}"
+    else:  # x.ndim == 3
+      assert x.shape[-1] == self._fields['num_features'], \
+        f"Expected {self._fields['num_features']} features, got {x.shape[-1]}"
+    
+    return super().__call__(x, train=train)
+
+
+class BatchNorm2d(Norm):
+  """
+  Input : (batch_size, height, width, num_channels)
+  """
+  def __init__(self, num_channels, eps=1e-4, momentum=0.9, scale=True, shift=True, use_running_stats=True):
+    super().__init__(impl='batch')
+    self._fields['axis'] = (-1,)
+    self._fields['eps'] = eps
+    self._fields['momentum'] = momentum
+    self._fields['scale'] = scale
+    self._fields['shift'] = shift
+    self._fields['num_channels'] = num_channels
+    self._fields['use_running_stats'] = use_running_stats
+      
+  def __call__(self, x, train=True):
+    assert x.ndim == 4, f"Expected 4D input, got shape {x.shape}"
+    assert x.shape[-1] == self._fields['num_channels'], \
+        f"Expected {self._fields['num_channels']} channels, got {x.shape[-1]}"
+    
+    return super().__call__(x, train=train)
 
 class Attention(nj.Module):
 
@@ -667,4 +764,11 @@ class GRU(nj.Module):
     update = jax.nn.sigmoid(update + self.update_bias)
     carry = output = update * cand + (1 - update) * carry
     return carry, output
+  
+
+
+
+
+
+
 

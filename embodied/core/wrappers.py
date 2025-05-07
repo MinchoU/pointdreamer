@@ -267,6 +267,7 @@ class CheckSpaces(Wrapper):
     dtype = np.array(value).dtype
     shape = np.array(value).shape
     lowest, highest = np.min(value), np.max(value)
+
     raise ValueError(
         f"Value for '{key}' with dtype {dtype}, shape {shape}, "
         f"lowest {lowest}, highest {highest} is not in {space}.")

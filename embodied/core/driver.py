@@ -4,9 +4,12 @@ import cloudpickle
 import elements
 import numpy as np
 import portal
-
+from copy import deepcopy
 
 class Driver:
+  '''
+  Driver modified to support pointcloud downsampling
+  '''
 
   def __init__(self, make_env_fns, parallel=True, **kwargs):
     assert len(make_env_fns) >= 1
@@ -47,13 +50,13 @@ class Driver:
 
   def on_step(self, callback):
     self.callbacks.append(callback)
-
-  def __call__(self, policy, steps=0, episodes=0):
+  
+  def __call__(self, policy, downsampler, steps=0, episodes=0):
     step, episode = 0, 0
     while step < steps or episode < episodes:
-      step, episode = self._step(policy, step, episode)
+      step, episode = self._step(policy, downsampler, step, episode)
 
-  def _step(self, policy, step, episode):
+  def _step(self, policy, downsampler, step, episode):
     acts = self.acts
     assert all(len(x) == self.length for x in acts.values())
     assert all(isinstance(v, np.ndarray) for v in acts.values())
@@ -64,6 +67,11 @@ class Driver:
     else:
       obs = [env.step(act) for env, act in zip(self.envs, acts)]
     obs = {k: np.stack([x[k] for x in obs]) for k in obs[0].keys()}
+    if downsampler is not None:
+      assert 'pointcloud' in obs
+      obs['raw_pointcloud'] = deepcopy(obs['pointcloud'])
+      obs['pointcloud'] = downsampler(obs['pointcloud'], "eval")
+
     logs = {k: v for k, v in obs.items() if k.startswith('log/')}
     obs = {k: v for k, v in obs.items() if not k.startswith('log/')}
     assert all(len(x) == self.length for x in obs.values()), obs

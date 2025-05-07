@@ -15,12 +15,13 @@ class Replay:
 
   def __init__(
       self, length, capacity=None, directory=None, chunksize=1024,
-      online=False, selector=None, save_wait=False, name='unnamed', seed=0):
+      online=False, selector=None, save_wait=False, name='unnamed', seed=0, multi_step_length=0):
 
     self.length = length
     self.capacity = capacity
     self.chunksize = chunksize
     self.name = name
+    self.excludes = ["raw_pointcloud", "render_image", "world_pointcloud", "obs_frame_pose"]
 
     self.sampler = selector or selectors.Uniform(seed)
 
@@ -51,6 +52,7 @@ class Replay:
     self.save_wait = save_wait
 
     self.metrics = {'samples': 0, 'inserts': 0, 'updates': 0}
+    self.multi_step_length = multi_step_length # for pcwm's multi step loss
 
   def __len__(self):
     return len(self.items)
@@ -75,7 +77,7 @@ class Replay:
 
   @elements.timer.section('replay_add')
   def add(self, step, worker=0):
-    step = {k: v for k, v in step.items() if not k.startswith('log/')}
+    step = {k: v for k, v in step.items() if not k.startswith('log/') and k not in self.excludes}
     with self.rwlock.reading:
       step = {k: np.asarray(v) for k, v in step.items()}
 
@@ -105,13 +107,13 @@ class Replay:
         self._complete(chunk, worker)
       assert len(self.streams) == len(self.current)
 
-      if len(stream) >= self.length:
+      if len(stream) >= self.length + self.multi_step_length:
         # Increment is not thread safe thus inaccurate but faster than locking.
         self.metrics['inserts'] += 1
         chunkid, index = stream.popleft()
         self._insert(chunkid, index)
 
-        if self.online and self.lengths[worker] % self.length == 0:
+        if self.online and self.lengths[worker] % self.length == self.multi_step_length:
           self.queue.append((chunkid, index))
 
       if self.online:
@@ -122,7 +124,7 @@ class Replay:
     message = f'Replay buffer {self.name} is empty'
     limiters.wait(lambda: len(self.sampler), message)
     seqs, is_online = zip(*[self._sample(mode) for _ in range(batch)])
-    data = self._assemble_batch(seqs, 0, self.length)
+    data = self._assemble_batch(seqs, 0, self.length+self.multi_step_length)
     data = self._annotate_batch(data, is_online, True)
     return data
 
@@ -193,16 +195,16 @@ class Replay:
   def _getseq(self, chunkid, index, keys=None, concat=True):
     chunk = self.chunks[chunkid]
     available = chunk.length - index
-    if available >= self.length:
+    if available >= self.length+self.multi_step_length:
       with elements.timer.section('get_slice'):
-        seq = chunk.slice(index, self.length)
+        seq = chunk.slice(index, self.length + self.multi_step_length)
         if not concat:
           seq = {k: [v] for k, v in seq.items()}
         return seq
     else:
       with elements.timer.section('get_compose'):
         parts = [chunk.slice(index, available)]
-        remaining = self.length - available
+        remaining = self.length + self.multi_step_length - available
         while remaining > 0:
           chunk = self.chunks[chunk.succ]
           used = min(remaining, chunk.length)

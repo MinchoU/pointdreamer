@@ -128,12 +128,21 @@ def main(argv=None):
 def make_agent(config):
   from .agent import Agent
   env = make_env(config, 0)
-  if "maniskill" in config.task:
-    config = config.update({"agent.depth_max": config.env.maniskill.depth_max_mm})
 
   notlog = lambda k: not k.startswith('log/')
   obs_space = {k: v for k, v in env.obs_space.items() if notlog(k)}
   act_space = {k: v for k, v in env.act_space.items() if k != 'reset'}
+
+  if "maniskill" in config.task:
+    config = config.update({"agent.depth_max": config.env.maniskill.depth_max_mm,
+                            "agent.use_pcd": 'pointcloud' in config.env.maniskill.obs_mode,
+                            "agent.n_downsample_pts": config.env.maniskill.n_downsample_pts,})
+    if 'pointcloud' in config.env.maniskill.obs_mode:
+      pcd_dim = 6 if "rgb" in config.env.maniskill.obs_mode else 3
+      obs_space['raw_pointcloud'] = obs_space['pointcloud']
+      obs_space["pointcloud"] = elements.Space(np.float32, (config.env.maniskill.n_downsample_pts, pcd_dim))
+  if config.agent.wm_type != "pcwm":
+    config = config.update({"agent.multi_step_length": 0})
 
   env.close()
   if config.random_agent:
@@ -178,7 +187,10 @@ def make_logger(config):
       name = '/'.join(logdir.split('/')[-4:])
       outputs.append(elements.logger.WandBOutput(name))
     elif output == 'scope':
-      outputs.append(elements.logger.ScopeOutput(elements.Path(logdir)))
+      scope_logger = elements.logger.ScopeOutput(elements.Path(logdir))
+      from scope.formats import Video
+      # scope_logger.writer.fmts[-1] = Video(fps=10, codec='mpeg4')
+      outputs.append(scope_logger)
     else:
       raise NotImplementedError(output)
   logger = elements.Logger(step, outputs, multiplier)
@@ -195,9 +207,10 @@ def make_replay(config, folder, mode='train'):
   directory = elements.Path(config.logdir) / folder
   if config.replicas > 1:
     directory /= f'{config.replica:05}'
+  multi_step_length = 0 if config.agent.wm_type != 'pcwm' else config.agent.multi_step_length
   kwargs = dict(
       length=length, capacity=int(capacity), online=config.replay.online,
-      chunksize=config.replay.chunksize, directory=directory)
+      chunksize=config.replay.chunksize, directory=directory, multi_step_length=multi_step_length)
 
   if config.replay.fracs.uniform < 1 and mode == 'train':
     assert config.jax.compute_dtype in ('bfloat16', 'float32'), (
@@ -271,7 +284,7 @@ def make_stream(config, replay, mode):
       stream,
       length=config.batch_length if mode == 'train' else config.report_length,
       consec=config.consec_train if mode == 'train' else config.consec_report,
-      prefix=config.replay_context,
+      prefix=config.replay_context + config.agent.multi_step_length * (config.agent.wm_type=="pcwm"),
       strict=(mode == 'train'),
       contiguous=True)
 

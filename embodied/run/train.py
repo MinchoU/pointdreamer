@@ -4,8 +4,7 @@ from functools import partial as bind
 import elements
 import embodied
 import numpy as np
-
-
+from pointclouds.pcd_utils import viz_world_pcd_img, viz_pcd_img
 def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
 
   agent = make_agent()
@@ -38,6 +37,30 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
       if value.dtype == np.uint8 and value.ndim == 3:
         if worker == 0:
           episode.add(f'policy_{key}', value, agg='stack')
+      elif value.dtype == np.uint16 and value.ndim == 3 and value.shape[-1] == 4:
+        if worker == 0:
+          episode.add(f'policy_{key}', value[...,:3].astype(np.uint8), agg='stack')
+      elif key == "pointcloud":
+        assert "raw_pointcloud" in tran
+        if worker == 0:
+          w, h, pad = 256, 256, 4
+          camera_settings = {
+                              'camera_position': (1.0038888282878466, -0.6127577168023789, 0.5753893737567826),
+                              'camera_focal_point': (-0.044459663331508636, 0.021982893347740173, -0.07509130239486694),
+                              'camera_up': (-0.4032507264417322, 0.23916935296929345, 0.8832818758609648),
+                            }
+          # pcd_img = viz_pcd_img(value, width=512, height=512, **camera_settings)
+          if "obs_frame_pose" in tran:
+            pcd_img = viz_world_pcd_img(value, tran["obs_frame_pose"], width=w, height=h, **camera_settings)
+            raw_pcd_img = viz_world_pcd_img(tran["raw_pointcloud"], tran["obs_frame_pose"], width=w, height=h, **camera_settings)
+          else:
+            pcd_img = viz_pcd_img(value, width=w, height=h, **camera_settings)
+            raw_pcd_img = viz_pcd_img(tran["raw_pointcloud"], width=w, height=h, **camera_settings)
+          # raw_pcd_img = viz_pcd_img(tran["raw_pointcloud"], width=512, height=512,**camera_settings)
+          vertical_padding = 255*np.ones((h,pad,3), dtype=np.uint8)
+          pcd_img_cat = np.concatenate([raw_pcd_img, vertical_padding, pcd_img], axis=1)
+        episode.add(f'policy_{key}', pcd_img_cat, agg='stack')
+
       elif key.startswith('log/'):
         assert value.ndim == 0, (key, value.shape, value.dtype)
         episode.add(key + '/avg', value, agg='avg')
@@ -91,10 +114,15 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
 
   print('Start training loop')
   policy = lambda *args: agent.policy(*args, mode='train')
+  if agent.model.use_pcd:
+    downsampler = lambda *args: agent.downsample(*args)
+  else:
+    downsampler = None
+
   driver.reset(agent.init_policy)
   while step < args.steps:
 
-    driver(policy, steps=10)
+    driver(policy, downsampler, steps=10)
 
     if should_report(step) and len(replay):
       agg = elements.Agg()
@@ -110,7 +138,7 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
       logger.add(usage.stats(), prefix='usage')
       logger.add({'fps/policy': policy_fps.result()})
       logger.add({'fps/train': train_fps.result()})
-      logger.add({'timer': elements.timer.stats()['summary']})
+      logger.add({'timer': elements.timer.stats(log=True)['summary']})
       logger.write()
 
     if should_save(step):

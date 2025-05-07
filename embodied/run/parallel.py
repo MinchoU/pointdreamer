@@ -368,6 +368,9 @@ def parallel_logger(make_logger, args):
         if value.dtype == np.uint8 and value.ndim == 3:
           if addr == first_addr:
             episode.add(f'policy_{key}', value, agg='stack')
+        elif value.dtype == np.uint16 and value.ndim == 3 and value.shape[-1] == 4:
+          if addr == first_addr:
+            episode.add(f'policy_{key}', value[...,:3].astype(np.uint8), agg='stack')
         elif key.startswith('log/'):
           assert value.ndim == 0, (key, value.shape, value.dtype)
           episode.add(key + '/avg', value, agg='avg')

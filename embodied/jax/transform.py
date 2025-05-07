@@ -85,10 +85,7 @@ def apply(
       seed = jax.random.fold_in(seed, jax.lax.axis_index('d'))
     params, outs = inner(params, *args, seed=seed)
     outs = (outs,) if single_output else outs
-    # try:
     assert isinstance(outs, tuple)
-    # except:
-    #   breakpoint()
     return (params, *outs) if return_params else outs
 
   if use_shardmap and len(mesh.devices) > 1:
