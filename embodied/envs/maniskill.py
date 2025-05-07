@@ -285,10 +285,9 @@ def sensor_data_to_pointcloud(observation: Dict, sensors: Dict[str, BaseSensor],
             images: Dict[str, np.ndarray]
             position = images["position"].copy().astype(np.float32)
             segmentation = images["segmentation"].copy()
+            w = (segmentation != 0) & (~np.isin(segmentation, seg_filters))
+            position[..., :3] /= 1000.0
 
-            position[..., :3] /= 1000.0 # mm to m
-            valid_mask = (segmentation != 0) & (~np.isin(segmentation, seg_filters))
-            w = valid_mask.astype(np.float32)[..., None]
             # Convert to world space
             cam2world = camera_params[cam_uid]["cam2world_gl"]
             xyzw = np.concatenate([position, w], axis=-1).reshape(

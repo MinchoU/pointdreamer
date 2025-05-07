@@ -20,3 +20,4 @@ from .pull_cube_tool import PullCubeToolEnv
 ## Custom Env
 from .pick_clutter_ycb_custom import PickClutterYCBEnv
 from .peg_insertion_side_nobase import PegInsertionSideEnv
+from .pick_cube_goalviz import PickCubeEnv

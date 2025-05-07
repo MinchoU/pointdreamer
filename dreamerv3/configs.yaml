@@ -1,5 +1,6 @@
 defaults:
-# python dreamerv3/main.py --logdir ./logdir/dreamer/{timestamp} --configs maniskill --task maniskill_PickCube-v1 --run.train_ratio 256 --run.envs 1 --agent.enc.typ pointconv  --env.maniskill.obs_mode=pointcloud+rgb --agent.wm_type pcwm --env.maniskill.cam_name base_camera --env.maniskill.obs_frame base_pose
+# python dreamerv3/main.py --logdir ./logdir/dreamer/{timestamp} --configs maniskill --task maniskill_PickCubeGoalViz-v1 --run.train_ratio 256 --run.envs 1 --agent.enc.typ pointconv  --env.maniskill.obs_mode=pointcloud+rgb --agent.wm_type pcwm --env.maniskill.cam_name base_camera --env.maniskill.obs_frame base_pose --env.maniskill.use_segmented_pts=True
+# python dreamerv3/main.py --logdir ./logdir/dreamer/{timestamp} --configs maniskill --task maniskill_PegInsertionSideNobase-v1 --run.train_ratio 256 --run.envs 1 --agent.enc.typ pointconv  --env.maniskill.obs_mode=pointcloud+rgb --agent.wm_type pcwm
   logdir: ~/logdir/{timestamp}
   replica: 0
   replicas: 1
