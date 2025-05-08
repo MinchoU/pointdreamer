@@ -61,6 +61,7 @@ class PickCubeEnv(BaseEnv):
         self.sensor_cam_target_pos = cfg["sensor_cam_target_pos"]
         self.human_cam_eye_pos = cfg["human_cam_eye_pos"]
         self.human_cam_target_pos = cfg["human_cam_target_pos"]
+        self.sensor_cam_eye_pos = [0.65, 0., 0.3]
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
 
     @property
@@ -68,7 +69,8 @@ class PickCubeEnv(BaseEnv):
         pose = sapien_utils.look_at(
             eye=self.sensor_cam_eye_pos, target=self.sensor_cam_target_pos
         )
-        return [CameraConfig("base_camera", pose, 128, 128, np.pi / 2, 0.01, 100)]
+        # return [CameraConfig("base_camera", pose, 128, 128, np.pi / 2, 0.01, 100)]
+        return [CameraConfig("base_camera", pose, 128, 128, np.pi / 4, 0.01, 100)]
 
     @property
     def _default_human_render_camera_configs(self):

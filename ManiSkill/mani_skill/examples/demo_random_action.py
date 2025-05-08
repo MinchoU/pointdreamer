@@ -106,9 +106,11 @@ def main(args: Args):
         if isinstance(viewer, sapien.utils.Viewer):
             viewer.paused = args.pause
         env.render()
+    step = 0
     while True:
         action = env.action_space.sample() if env.action_space is not None else None
         obs, reward, terminated, truncated, info = env.step(action)
+        step += 1
         if verbose:
             print("reward", reward)
             print("terminated", terminated)
@@ -119,6 +121,9 @@ def main(args: Args):
         if args.render_mode is None or args.render_mode != "human":
             if (terminated | truncated).any():
                 break
+        if step == 100:
+            env.reset()
+            step=0
     env.close()
 
     if record_dir:
